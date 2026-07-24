@@ -50,6 +50,18 @@ Inspect the tunnel:
 ./media logs cloudflared --tail 200
 ```
 
+## qBittorrent credentials cannot be configured
+
+The initial setup uses the temporary password printed by qBittorrent. Existing installations use the credentials stored in `.env`.
+
+If the password was changed through the Web UI, update `QBITTORRENT_PASSWORD` in `.env` to the same current password before running another management command. The CLI cannot replace an existing unknown password because the Web API requires the current credentials.
+
+Inspect startup messages without sharing their contents:
+
+```bash
+./media logs qbittorrent
+```
+
 ## Update is refused
 
 `./media update` requires a clean tracked Git worktree and uses `git pull --ff-only`. Commit or stash tracked local changes before retrying. Keep machine-specific values in `.env`, which Git ignores.

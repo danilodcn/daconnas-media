@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
+import json
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -22,7 +29,14 @@ DIRECTORY_KEYS = (
     "DOWNLOADS_DIR",
     "BACKUPS_DIR",
 )
-REQUIRED_KEYS = DIRECTORY_KEYS + ("PUID", "PGID", "TZ", "CLOUDFLARE_TUNNEL_TOKEN")
+REQUIRED_KEYS = DIRECTORY_KEYS + (
+    "PUID",
+    "PGID",
+    "TZ",
+    "CLOUDFLARE_TUNNEL_TOKEN",
+    "QBITTORRENT_USERNAME",
+    "QBITTORRENT_PASSWORD",
+)
 PORT_KEYS = (
     "JELLYFIN_PORT",
     "SEERR_PORT",
@@ -175,6 +189,109 @@ def create_directories(env: dict[str, str]) -> None:
     (Path(env["MEDIA_DIR"]) / "tv").mkdir(exist_ok=True)
 
 
+def qbittorrent_url(env: dict[str, str]) -> str:
+    address = env["ADMIN_BIND_ADDRESS"]
+    if address in ("0.0.0.0", "::"):
+        address = "127.0.0.1"
+    if ":" in address:
+        address = f"[{address}]"
+    return f"http://{address}:{env['QBITTORRENT_PORT']}"
+
+
+def wait_for_qbittorrent(base_url: str) -> None:
+    endpoint = f"{base_url}/api/v2/app/version"
+    for _ in range(30):
+        try:
+            urllib.request.urlopen(endpoint, timeout=2)
+            return
+        except urllib.error.HTTPError:
+            return
+        except urllib.error.URLError:
+            time.sleep(1)
+    raise MediaError("qBittorrent did not become available within 30 seconds.")
+
+
+def qbittorrent_login(
+    base_url: str,
+    username: str,
+    password: str,
+) -> urllib.request.OpenerDirector | None:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    payload = urllib.parse.urlencode(
+        {"username": username, "password": password}
+    ).encode()
+    request = urllib.request.Request(
+        f"{base_url}/api/v2/auth/login",
+        data=payload,
+        headers={"Referer": base_url},
+    )
+    try:
+        response = opener.open(request, timeout=5)
+    except urllib.error.HTTPError:
+        return None
+    return opener if response.read().strip() == b"Ok." else None
+
+
+def temporary_qbittorrent_password(compose: list[str]) -> str | None:
+    result = run(
+        compose + ["logs", "--no-color", "qbittorrent"],
+        capture=True,
+        check=False,
+    )
+    match = re.search(
+        r"temporary password is provided for this session:\s*(\S+)",
+        result.stdout,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def qbittorrent_session(
+    env: dict[str, str],
+    compose: list[str],
+    base_url: str,
+) -> urllib.request.OpenerDirector:
+    session = qbittorrent_login(
+        base_url,
+        env["QBITTORRENT_USERNAME"],
+        env["QBITTORRENT_PASSWORD"],
+    )
+    if session:
+        return session
+
+    temporary_password = temporary_qbittorrent_password(compose)
+    if temporary_password:
+        session = qbittorrent_login(base_url, "admin", temporary_password)
+    if session:
+        return session
+    raise MediaError(
+        "Unable to configure qBittorrent credentials. "
+        "The existing password may differ from QBITTORRENT_PASSWORD."
+    )
+
+
+def configure_qbittorrent(env: dict[str, str], compose: list[str]) -> None:
+    base_url = qbittorrent_url(env)
+    wait_for_qbittorrent(base_url)
+    session = qbittorrent_session(env, compose, base_url)
+    preferences = json.dumps(
+        {
+            "web_ui_username": env["QBITTORRENT_USERNAME"],
+            "web_ui_password": env["QBITTORRENT_PASSWORD"],
+        }
+    )
+    payload = urllib.parse.urlencode({"json": preferences}).encode()
+    request = urllib.request.Request(
+        f"{base_url}/api/v2/app/setPreferences",
+        data=payload,
+        headers={"Referer": base_url},
+    )
+    session.open(request, timeout=5).read()
+    print("qBittorrent credentials are configured.")
+
+
 def command_setup(args: argparse.Namespace) -> None:
     require_commands("docker")
     if not ENV_FILE.exists():
@@ -190,6 +307,7 @@ def command_setup(args: argparse.Namespace) -> None:
         print("Configuration is valid. Services were not started.")
         return
     run(compose + ["up", "-d", "--remove-orphans"])
+    configure_qbittorrent(env, compose)
     print_urls(env)
 
 
@@ -197,6 +315,7 @@ def command_up(args: argparse.Namespace) -> None:
     env, hardware, compose = validated_context(args.hardware)
     print(f"Using {hardware} hardware profile.")
     run(compose + ["up", "-d", "--remove-orphans"])
+    configure_qbittorrent(env, compose)
     print_urls(env)
 
 
@@ -208,6 +327,7 @@ def command_down(args: argparse.Namespace) -> None:
 def command_restart(args: argparse.Namespace) -> None:
     env, _, compose = validated_context(args.hardware)
     run(compose + ["restart"])
+    configure_qbittorrent(env, compose)
     print_urls(env)
 
 
@@ -246,6 +366,7 @@ def command_update(args: argparse.Namespace) -> None:
     print(f"Using {hardware} hardware profile.")
     run(compose + ["pull"])
     run(compose + ["up", "-d", "--remove-orphans"])
+    configure_qbittorrent(env, compose)
     run(compose + ["ps"])
     print_urls(env)
 

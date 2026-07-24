@@ -22,6 +22,19 @@ The stack creates `movies` and `tv` inside `MEDIA_DIR`. Containers use consisten
 
 Configure Radarr to use `/data/media/movies`, Sonarr to use `/data/media/tv`, and both download clients to use `/data/downloads`.
 
+## Configure qBittorrent credentials
+
+Set the Web UI credentials in `.env`:
+
+```dotenv
+QBITTORRENT_USERNAME=admin
+QBITTORRENT_PASSWORD=replace-with-a-strong-password
+```
+
+The LinuxServer image does not provide native username or password environment variables. After qBittorrent starts, the management CLI reads its temporary password from the container log and uses the official Web API to apply the configured credentials. The password is not passed into the container environment.
+
+On later runs, the CLI verifies the configured credentials and reapplies them. To change an existing password, change it in the qBittorrent Web UI and immediately update `.env` to the same value.
+
 ## Configure identity
 
 Set `PUID` and `PGID` to the account that owns the storage:

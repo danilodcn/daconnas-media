@@ -31,6 +31,8 @@ Containers communicate through the Docker network:
 
 Use `http://gluetun:8080` for qBittorrent when VPN mode is enabled.
 
+The qBittorrent Web UI uses `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD` from `.env`. `./media setup`, `./media up`, `./media restart`, and `./media update` ensure that those credentials remain valid.
+
 ## Storage ownership
 
 Sonarr, Radarr, Bazarr, and qBittorrent use the configured `PUID` and `PGID`. Jellyfin uses the same numeric identity. Ensure that identity can read and write the configured directories.

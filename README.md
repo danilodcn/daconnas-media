@@ -41,6 +41,8 @@ The first run creates `.env` and stops. Edit the generated file, then run:
 ./media setup
 ```
 
+Set `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD` in `.env`. The setup command applies them through the qBittorrent Web API after the first container startup.
+
 After a reboot:
 
 ```bash
