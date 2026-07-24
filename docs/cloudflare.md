@@ -2,13 +2,51 @@
 
 ## Tunnel
 
-Create a remotely managed tunnel in Cloudflare Zero Trust and copy its token into `.env`:
+This stack uses a remotely managed tunnel. Its routes stay in Cloudflare, while the connector authenticates with a tunnel token stored in `.env`.
+
+### Create the tunnel and obtain its token
+
+1. Sign in to the [Cloudflare dashboard](https://dash.cloudflare.com/).
+2. Open **Networking > Tunnels**.
+3. Select **Create a tunnel**.
+4. Enter a name such as `daconnas-media`.
+5. Select **Create Tunnel**.
+6. Under the connector setup, select **Docker**.
+7. Copy the installation command into a text editor. Do not run it.
+8. Find the value after `--token`. It starts with `eyJ` and is the tunnel token.
+9. Copy only that value into `.env`:
+
 
 ```dotenv
 CLOUDFLARE_TUNNEL_TOKEN=replace-me
 ```
 
-The token is a secret and must never be committed.
+10. Start the stack:
+
+```bash
+./media up
+```
+
+11. Return to **Networking > Tunnels** and wait until the connector reports a healthy status.
+
+The repository already runs `cloudflared` in Docker. Do not run the installation command displayed by Cloudflare on the host.
+
+### Retrieve the token for an existing tunnel
+
+1. Open **Networking > Tunnels**.
+2. Select the tunnel.
+3. Select **Add a replica**.
+4. Choose **Docker**.
+5. Copy the installation command into a text editor.
+6. Copy only the `eyJ...` value after `--token` into `CLOUDFLARE_TUNNEL_TOKEN`.
+
+Anyone with this token can run a connector for the tunnel. Never commit it, paste it into logs, or share the complete installation command. If it is exposed, rotate it from the tunnel page, update `.env`, and recreate the connector:
+
+```bash
+./media up
+```
+
+Refer to the Cloudflare documentation for [creating a remotely managed tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/) and [managing tunnel tokens](https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/).
 
 Configure public hostnames in the Cloudflare dashboard using these internal targets:
 
