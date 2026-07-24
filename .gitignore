@@ -1,0 +1,9 @@
+.env
+appdata/
+backups/
+cache/
+downloads/
+media-library/
+*.tar.gz
+__pycache__/
+*.pyc

@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tarfile
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+ENV_FILE = ROOT / ".env"
+ENV_EXAMPLE = ROOT / ".env.example"
+HARDWARE_OPTIONS = ("auto", "cpu", "intel", "nvidia")
+DIRECTORY_KEYS = (
+    "APPDATA_DIR",
+    "CACHE_DIR",
+    "MEDIA_DIR",
+    "DOWNLOADS_DIR",
+    "BACKUPS_DIR",
+)
+REQUIRED_KEYS = DIRECTORY_KEYS + ("PUID", "PGID", "TZ", "CLOUDFLARE_TUNNEL_TOKEN")
+PORT_KEYS = (
+    "JELLYFIN_PORT",
+    "SEERR_PORT",
+    "SONARR_PORT",
+    "RADARR_PORT",
+    "PROWLARR_PORT",
+    "BAZARR_PORT",
+    "QBITTORRENT_PORT",
+    "HOMEPAGE_PORT",
+    "FLARESOLVERR_PORT",
+)
+
+
+class MediaError(RuntimeError):
+    pass
+
+
+def run(
+    command: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        check=check,
+        text=True,
+        capture_output=capture,
+    )
+
+
+def read_env() -> dict[str, str]:
+    if not ENV_FILE.exists():
+        raise MediaError("Missing .env file. Run './media setup' first.")
+
+    values: dict[str, str] = {}
+    for raw_line in ENV_FILE.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def require_commands(*commands: str) -> None:
+    missing = [command for command in commands if shutil.which(command) is None]
+    if missing:
+        raise MediaError(f"Missing required commands: {', '.join(missing)}")
+
+
+def validate_env(env: dict[str, str]) -> None:
+    missing = [key for key in REQUIRED_KEYS if not env.get(key)]
+    if missing:
+        raise MediaError(f"Missing required .env values: {', '.join(missing)}")
+
+    relative = [key for key in DIRECTORY_KEYS if not Path(env[key]).is_absolute()]
+    if relative:
+        raise MediaError(f"Directory values must be absolute: {', '.join(relative)}")
+    validate_number(env, "PUID", 0, 2**31 - 1)
+    validate_number(env, "PGID", 0, 2**31 - 1)
+    for key in PORT_KEYS:
+        validate_number(env, key, 1, 65535)
+
+
+def validate_number(env: dict[str, str], key: str, minimum: int, maximum: int) -> None:
+    try:
+        value = int(env.get(key, ""))
+    except ValueError as error:
+        raise MediaError(f"{key} must be an integer.") from error
+    if not minimum <= value <= maximum:
+        raise MediaError(f"{key} must be between {minimum} and {maximum}.")
+
+
+def detect_hardware() -> str:
+    if shutil.which("nvidia-smi") and run(["nvidia-smi"], check=False).returncode == 0:
+        return "nvidia"
+    if Path("/dev/dri/renderD128").exists():
+        return "intel"
+    return "cpu"
+
+
+def selected_hardware(env: dict[str, str], override: str | None) -> str:
+    hardware = override or env.get("JELLYFIN_HARDWARE_ACCEL", "auto")
+    if hardware not in HARDWARE_OPTIONS:
+        raise MediaError(f"Unsupported hardware profile: {hardware}")
+    return detect_hardware() if hardware == "auto" else hardware
+
+
+def compose_command(env: dict[str, str], hardware: str) -> list[str]:
+    command = [
+        "docker",
+        "compose",
+        "--env-file",
+        str(ENV_FILE),
+        "-f",
+        str(ROOT / "compose.yml"),
+        "-f",
+        str(ROOT / f"compose.hardware.{hardware}.yml"),
+    ]
+    if env.get("VPN_ENABLED", "false").lower() == "true":
+        command.extend(["-f", str(ROOT / "compose.vpn.yml")])
+    return command
+
+
+def validate_hardware(env: dict[str, str], hardware: str) -> None:
+    if hardware == "intel":
+        if not Path("/dev/dri").exists():
+            raise MediaError("Intel hardware acceleration selected, but /dev/dri is unavailable.")
+        validate_number(env, "RENDER_GID", 1, 2**31 - 1)
+    if hardware != "nvidia":
+        return
+    require_commands("nvidia-smi")
+    if run(["nvidia-smi"], check=False).returncode != 0:
+        raise MediaError("NVIDIA hardware acceleration selected, but nvidia-smi failed.")
+
+
+def validate_vpn(env: dict[str, str]) -> None:
+    if env.get("VPN_ENABLED", "false").lower() != "true":
+        return
+    required = ("VPN_SERVICE_PROVIDER", "VPN_TYPE")
+    missing = [key for key in required if not env.get(key)]
+    if missing:
+        raise MediaError(f"Missing VPN values: {', '.join(missing)}")
+    if env["VPN_TYPE"].lower() != "wireguard":
+        return
+    wireguard = ("WIREGUARD_PRIVATE_KEY", "WIREGUARD_ADDRESSES")
+    missing = [key for key in wireguard if not env.get(key)]
+    if missing:
+        raise MediaError(f"Missing WireGuard values: {', '.join(missing)}")
+
+
+def validated_context(hardware_override: str | None) -> tuple[dict[str, str], str, list[str]]:
+    require_commands("docker")
+    env = read_env()
+    validate_env(env)
+    validate_vpn(env)
+    hardware = selected_hardware(env, hardware_override)
+    validate_hardware(env, hardware)
+    command = compose_command(env, hardware)
+    run(command + ["config", "--quiet"])
+    return env, hardware, command
+
+
+def create_directories(env: dict[str, str]) -> None:
+    for key in DIRECTORY_KEYS:
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
+    (Path(env["MEDIA_DIR"]) / "movies").mkdir(exist_ok=True)
+    (Path(env["MEDIA_DIR"]) / "tv").mkdir(exist_ok=True)
+
+
+def command_setup(args: argparse.Namespace) -> None:
+    require_commands("docker")
+    if not ENV_FILE.exists():
+        shutil.copyfile(ENV_EXAMPLE, ENV_FILE)
+        ENV_FILE.chmod(0o600)
+        print(f"Created {ENV_FILE}. Configure it, then run './media setup' again.")
+        return
+
+    env, hardware, compose = validated_context(args.hardware)
+    create_directories(env)
+    print(f"Using {hardware} hardware profile.")
+    if args.no_start:
+        print("Configuration is valid. Services were not started.")
+        return
+    run(compose + ["up", "-d", "--remove-orphans"])
+    print_urls(env)
+
+
+def command_up(args: argparse.Namespace) -> None:
+    env, hardware, compose = validated_context(args.hardware)
+    print(f"Using {hardware} hardware profile.")
+    run(compose + ["up", "-d", "--remove-orphans"])
+    print_urls(env)
+
+
+def command_down(args: argparse.Namespace) -> None:
+    _, _, compose = validated_context(args.hardware)
+    run(compose + ["down"])
+
+
+def command_restart(args: argparse.Namespace) -> None:
+    env, _, compose = validated_context(args.hardware)
+    run(compose + ["restart"])
+    print_urls(env)
+
+
+def command_status(args: argparse.Namespace) -> None:
+    env, hardware, compose = validated_context(args.hardware)
+    print(f"Hardware profile: {hardware}")
+    run(compose + ["ps"])
+    print_urls(env)
+
+
+def command_logs(args: argparse.Namespace) -> None:
+    _, _, compose = validated_context(args.hardware)
+    command = compose + ["logs", "--tail", str(args.tail)]
+    if args.follow:
+        command.append("--follow")
+    command.extend(args.services)
+    run(command)
+
+
+def ensure_clean_repository() -> None:
+    result = run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        capture=True,
+    )
+    if result.stdout.strip():
+        raise MediaError("Tracked files have local changes. Commit or stash them before updating.")
+
+
+def command_update(args: argparse.Namespace) -> None:
+    require_commands("git", "docker")
+    if not (ROOT / ".git").exists():
+        raise MediaError("This directory is not a Git repository.")
+    ensure_clean_repository()
+    run(["git", "pull", "--ff-only"])
+    env, hardware, compose = validated_context(args.hardware)
+    print(f"Using {hardware} hardware profile.")
+    run(compose + ["pull"])
+    run(compose + ["up", "-d", "--remove-orphans"])
+    run(compose + ["ps"])
+    print_urls(env)
+
+
+def backup_name() -> str:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return f"daconnas-media-{timestamp}.tar.gz"
+
+
+def command_backup(args: argparse.Namespace) -> None:
+    env, _, compose = validated_context(args.hardware)
+    source = Path(env["APPDATA_DIR"])
+    if not source.exists():
+        raise MediaError(f"Application data directory does not exist: {source}")
+
+    destination = Path(env["BACKUPS_DIR"])
+    if destination.is_relative_to(source):
+        raise MediaError("BACKUPS_DIR must not be inside APPDATA_DIR.")
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = destination / backup_name()
+    run(compose + ["stop"])
+    try:
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(source, arcname="appdata")
+        archive.chmod(0o600)
+    finally:
+        run(compose + ["start"], check=False)
+    print(f"Backup created: {archive}")
+
+
+def command_config(args: argparse.Namespace) -> None:
+    _, hardware, compose = validated_context(args.hardware)
+    print(f"Hardware profile: {hardware}", file=sys.stderr)
+    run(compose + ["config"])
+
+
+def print_urls(env: dict[str, str]) -> None:
+    entries = (
+        ("Jellyfin", "JELLYFIN_PORT"),
+        ("Seerr", "SEERR_PORT"),
+        ("Sonarr", "SONARR_PORT"),
+        ("Radarr", "RADARR_PORT"),
+        ("Prowlarr", "PROWLARR_PORT"),
+        ("Bazarr", "BAZARR_PORT"),
+        ("qBittorrent", "QBITTORRENT_PORT"),
+    )
+    print("Local services:")
+    for name, key in entries:
+        print(f"  {name}: http://localhost:{env[key]}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage the Daconnas media stack.")
+    parser.add_argument("--hardware", choices=HARDWARE_OPTIONS)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup = subparsers.add_parser("setup", help="Validate and initialize the stack.")
+    setup.add_argument("--no-start", action="store_true")
+    setup.set_defaults(handler=command_setup)
+
+    for name, handler in (
+        ("up", command_up),
+        ("down", command_down),
+        ("restart", command_restart),
+        ("status", command_status),
+        ("update", command_update),
+        ("backup", command_backup),
+        ("config", command_config),
+    ):
+        command = subparsers.add_parser(name)
+        command.set_defaults(handler=handler)
+
+    logs = subparsers.add_parser("logs")
+    logs.add_argument("services", nargs="*")
+    logs.add_argument("--follow", "-f", action="store_true")
+    logs.add_argument("--tail", type=int, default=100)
+    logs.set_defaults(handler=command_logs)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        args.handler(args)
+    except (MediaError, OSError, subprocess.CalledProcessError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
