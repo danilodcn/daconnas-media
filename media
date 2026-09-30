@@ -231,7 +231,8 @@ def qbittorrent_login(
         response = opener.open(request, timeout=5)
     except urllib.error.HTTPError:
         return None
-    return opener if response.read().strip() == b"Ok." else None
+    body = response.read().strip()
+    return opener if body in (b"", b"Ok.") else None
 
 
 def temporary_qbittorrent_password(compose: list[str]) -> str | None:
