@@ -22,3 +22,7 @@
 
 - Keep shell scripts small, linear, and focused on command orchestration.
 - Use Python instead of shell when branching, state management, validation, error handling, or data processing makes a shell script difficult to understand or maintain.
+
+## Planning
+
+- Save design specs and implementation plans in `docs/planning/<slug>/`, one directory per topic.
